@@ -19,15 +19,8 @@ def is_admin(update: Update) -> bool:
     return update.effective_user.id == TELEGRAM_ADMIN_ID
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    await update.message.reply_text(
-        "🏆 *WCDAILY Bot*\n\n"
-        "`/clip [url]` — cut YouTube video into clips\n"
-        "`/reel [url] [caption]` — Short → post to IG\n"
-        "`/status` — check integrations\n"
-        "`/pause` / `/resume` — toggle auto-posting",
-        parse_mode="Markdown"
-    )
+    user_id = update.effective_user.id
+    await update.message.reply_text(f"Your ID is: {user_id}")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
