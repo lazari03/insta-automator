@@ -17,22 +17,17 @@ POSTED_TODAY_FILE = Path("posted_today.json")
 CHECK_INTERVAL    = 1800  # 30 min
 DAILY_LIMIT       = 10
 
-# YouTube RSS feeds — no IP blocking, always works
-CHANNELS = [
-    ("FIFA",       "UCpcTrCXblq78GZrTUTLWeBw"),
-    # Add more channel IDs here if needed
-    # ("Goal",     "UCnUYZLuoy1rq1aVMwx4aTzw"),
-]
+# Source: FIFA World Cup Instagram
+SOURCE_IG_USER    = "fifaworldcup"
 
 WC_KEYWORDS = [
-    "world cup", "worldcup", "fifa world cup", "2026", "wc26",
-    "goal", "match", "final", "group stage", "qualifier", "semifinal",
+    "world cup", "worldcup", "2026", "wc26", "goal", "match",
+    "final", "group", "qualifier", "semifinal", "highlight",
     "mbappe", "messi", "ronaldo", "haaland", "neymar", "vinicius",
     "brazil", "argentina", "france", "england", "germany",
     "spain", "portugal", "morocco", "japan", "usa", "mexico",
-    "highlight", "highlights", "scored", "penalty", "free kick",
-    "freekick", "hat trick", "assist", "winner", "eliminated",
-    "knockout", "group", "quarter", "semi"
+    "scored", "penalty", "free kick", "hat trick", "assist",
+    "winner", "eliminated", "knockout", "quarter", "semi", "fifa"
 ]
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -70,63 +65,129 @@ def notify(text):
     except Exception as e:
         logging.error(f"Notify error: {e}")
 
-def is_wc_related(title):
-    t = title.lower()
+def is_wc_related(text):
+    t = (text or "").lower()
     return any(kw in t for kw in WC_KEYWORDS)
 
-# ── RSS fetch — no IP blocking ────────────────────────────────────────────────
+# ── Fetch from Instagram source via Graph API ─────────────────────────────────
 
-def fetch_rss(channel_id: str) -> list:
-    """Fetch latest videos from YouTube RSS feed. Always works on Railway."""
-    url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-    r = requests.get(url, timeout=15)
-    if r.status_code != 200:
-        raise RuntimeError(f"RSS fetch failed: {r.status_code}")
+def get_source_ig_videos() -> list:
+    """
+    Fetch recent Reels from @fifaworldcup using Instagram Graph API.
+    Requires IG_ACCESS_TOKEN with instagram_basic permission.
+    """
+    if not IG_ACCESS_TOKEN or not IG_USER_ID:
+        raise RuntimeError("Instagram not configured")
 
-    ns = {
-        "atom":  "http://www.w3.org/2005/Atom",
-        "yt":    "http://www.youtube.com/xml/schemas/2015",
-        "media": "http://search.yahoo.com/mrss/",
+    # Search for the fifaworldcup account ID first
+    # Then fetch their media — only works if they are in your test users
+    # or your app is approved for pages_read_engagement
+
+    # Alternative: use IG Basic Display API to fetch by username
+    # For now fetch from a hardcoded known ID or use oEmbed
+    url = f"https://graph.instagram.com/v18.0/{IG_USER_ID}/media"
+    params = {
+        "fields": "id,media_type,caption,media_url,permalink,timestamp",
+        "access_token": IG_ACCESS_TOKEN,
+        "limit": 20
     }
-    root = ET.fromstring(r.text)
+    r = requests.get(url, params=params, timeout=15)
+    data = r.json()
+    if "error" in data:
+        raise RuntimeError(f"IG API error: {data['error']}")
+
     videos = []
-    for entry in root.findall("atom:entry", ns):
-        vid_id = entry.find("yt:videoId", ns)
-        title  = entry.find("atom:title", ns)
-        if vid_id is None or title is None:
+    for item in data.get("data", []):
+        if item.get("media_type") in ("VIDEO", "REELS"):
+            caption = item.get("caption", "")
+            videos.append({
+                "id":        item["id"],
+                "title":     caption[:80] if caption else "FIFA World Cup",
+                "caption":   caption,
+                "url":       item.get("media_url", ""),
+                "permalink": item.get("permalink", ""),
+            })
+    return videos
+
+def get_source_videos_ytdlp() -> list:
+    """
+    Fallback: use yt-dlp to fetch from Instagram profile.
+    Works on Railway for Instagram (unlike YouTube).
+    """
+    cmd = [
+        "yt-dlp",
+        f"https://www.instagram.com/{SOURCE_IG_USER}/reels/",
+        "--flat-playlist",
+        "--playlist-items", "1-20",
+        "--print", '{"id":"%(id)s","title":"%(title)s","url":"%(webpage_url)s"}',
+        "--quiet", "--no-warnings",
+        "--no-check-certificates",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    videos = []
+    for line in result.stdout.strip().splitlines():
+        try:
+            v = json.loads(line)
+            videos.append(v)
+        except Exception:
             continue
-        videos.append({
-            "id":    vid_id.text,
-            "title": title.text,
-            "url":   f"https://www.youtube.com/shorts/{vid_id.text}",
-        })
     return videos
 
 def get_all_wc_videos() -> list:
-    """Fetch from all channels, filter WC related."""
-    all_videos = []
-    for name, channel_id in CHANNELS:
-        try:
-            videos = fetch_rss(channel_id)
-            wc = [v for v in videos if is_wc_related(v["title"])]
-            all_videos.extend(wc)
-            logging.info(f"{name}: {len(videos)} videos, {len(wc)} WC related")
-        except Exception as e:
-            logging.error(f"RSS error for {name}: {e}")
-    return all_videos
+    """Try Graph API first, fall back to yt-dlp."""
+    try:
+        videos = get_source_ig_videos()
+        logging.info(f"Graph API: {len(videos)} videos fetched")
+        return [v for v in videos if is_wc_related(v.get("caption", "") + v.get("title", ""))]
+    except Exception as e:
+        logging.warning(f"Graph API failed: {e} — trying yt-dlp")
 
-# ── Video processing ──────────────────────────────────────────────────────────
+    try:
+        videos = get_source_videos_ytdlp()
+        logging.info(f"yt-dlp: {len(videos)} videos fetched")
+        return [v for v in videos if is_wc_related(v.get("title", ""))]
+    except Exception as e:
+        logging.error(f"yt-dlp also failed: {e}")
+        return []
 
-def download_and_strip(url, work_dir):
+# ── Video download ────────────────────────────────────────────────────────────
+
+def download_video(video: dict, work_dir: str) -> Path:
+    """
+    Download video — tries direct media_url first (fastest),
+    then falls back to yt-dlp with the permalink.
+    """
     raw   = Path(work_dir) / "raw.mp4"
     clean = Path(work_dir) / "clean.mp4"
-    r1 = subprocess.run([
-        "yt-dlp", url, "-o", str(raw),
-        "-f", "best[ext=mp4]/best",
-        "--quiet", "--no-warnings"
-    ], timeout=120, capture_output=True)
-    if not raw.exists():
-        raise RuntimeError(f"Download failed: {r1.stderr.decode()[:200]}")
+
+    # Try direct URL download first (from Graph API media_url)
+    direct_url = video.get("url", "")
+    if direct_url and direct_url.startswith("http"):
+        try:
+            r = requests.get(direct_url, timeout=60, stream=True)
+            if r.status_code == 200:
+                with open(raw, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                logging.info("Downloaded via direct URL")
+        except Exception as e:
+            logging.warning(f"Direct download failed: {e}")
+
+    # Fallback: yt-dlp with permalink or constructed URL
+    if not raw.exists() or raw.stat().st_size < 1000:
+        permalink = video.get("permalink") or f"https://www.instagram.com/p/{video['id']}/"
+        subprocess.run([
+            "yt-dlp", permalink,
+            "-o", str(raw),
+            "-f", "best[ext=mp4]/best",
+            "--quiet", "--no-warnings",
+            "--no-check-certificates",
+        ], timeout=120, capture_output=True)
+
+    if not raw.exists() or raw.stat().st_size < 1000:
+        raise RuntimeError("Download failed — file empty or missing")
+
+    # Strip metadata + ensure 9:16
     subprocess.run([
         "ffmpeg", "-y", "-i", str(raw),
         "-map", "0", "-map_metadata", "-1",
@@ -136,11 +197,14 @@ def download_and_strip(url, work_dir):
         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
         str(clean)
     ], capture_output=True, timeout=120)
+
     if not clean.exists():
         raise RuntimeError("FFmpeg processing failed")
     return clean
 
-def upload_to_fileio(video_path):
+# ── Upload + post ─────────────────────────────────────────────────────────────
+
+def upload_to_fileio(video_path: Path) -> str:
     with open(video_path, "rb") as f:
         r = requests.post(
             "https://file.io",
@@ -153,7 +217,7 @@ def upload_to_fileio(video_path):
         raise RuntimeError(f"Upload failed: {data}")
     return data["link"]
 
-def post_to_instagram(video_url, caption):
+def post_to_instagram(video_url: str, caption: str) -> dict:
     if not IG_ACCESS_TOKEN or not IG_USER_ID:
         return {"error": "Instagram not configured"}
     r = requests.post(
@@ -169,7 +233,7 @@ def post_to_instagram(video_url, caption):
         raise RuntimeError(f"Container error: {data}")
     container_id = data["id"]
     import time
-    for _ in range(24):
+    for _ in range(30):
         time.sleep(5)
         s = requests.get(
             f"https://graph.instagram.com/v18.0/{container_id}",
@@ -187,35 +251,34 @@ def post_to_instagram(video_url, caption):
     )
     return pub.json()
 
-def build_caption(title):
-    t = title.lower()
-    tags = "#WorldCup #FIFA #wcdaily #Shorts #Football"
+def build_caption(original_caption: str, title: str = "") -> str:
+    base = (original_caption or title or "FIFA World Cup Highlight")[:300]
+    tags = "#WorldCup #FIFA #wcdaily #Reels #Football"
+    t = base.lower()
     extra = []
     if "mbappe"    in t: extra.append("#Mbappe")
     if "messi"     in t: extra.append("#Messi")
-    if "ronaldo"   in t: extra.append("#Ronaldo #CR7")
+    if "ronaldo"   in t: extra.append("#Ronaldo")
     if "haaland"   in t: extra.append("#Haaland")
-    if "goal"      in t: extra.append("#Goal #Gol")
+    if "goal"      in t: extra.append("#Goal")
     if "penalty"   in t: extra.append("#Penalty")
     if "final"     in t: extra.append("#WorldCupFinal")
     if "brazil"    in t: extra.append("#Brazil")
     if "argentina" in t: extra.append("#Argentina")
-    if "france"    in t: extra.append("#France")
     if extra:
         tags += " " + " ".join(extra[:4])
-    return f"{title}\n\n⚽ {tags}"
+    return f"{base}\n\n⚽ {tags}"
 
 # ── Process one video ─────────────────────────────────────────────────────────
 
 def process_video(video: dict) -> bool:
-    """Download, strip, upload, post. Returns True on success."""
     work_dir = tempfile.mkdtemp()
     try:
-        notify(f"⬇️ Downloading:\n{video['title']}")
-        clean     = download_and_strip(video["url"], work_dir)
-        notify("☁️ Uploading...")
+        notify(f"⬇️ Downloading:\n{video.get('title','')[:60]}")
+        clean     = download_video(video, work_dir)
+        notify("☁️ Uploading to temp host...")
         video_url = upload_to_fileio(clean)
-        caption   = build_caption(video["title"])
+        caption   = build_caption(video.get("caption", ""), video.get("title", ""))
         notify("📲 Posting to Instagram...")
         result    = post_to_instagram(video_url, caption)
         if "id" in result:
@@ -223,7 +286,7 @@ def process_video(video: dict) -> bool:
             mark_seen(video["id"])
             notify(
                 f"✅ Posted!\n"
-                f"📹 {video['title']}\n"
+                f"📹 {video.get('title','')[:60]}\n"
                 f"🆔 {result['id']}\n"
                 f"📊 {get_posted_today()}/{DAILY_LIMIT} today"
             )
@@ -233,7 +296,7 @@ def process_video(video: dict) -> bool:
             mark_seen(video["id"])
             return False
     except Exception as e:
-        notify(f"❌ Failed:\n{video['title']}\n{str(e)[:200]}")
+        notify(f"❌ Failed:\n{str(e)[:200]}")
         return False
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -244,9 +307,9 @@ async def monitor_loop(app):
     await asyncio.sleep(5)
     notify(
         "🤖 WCDAILY Bot started\n"
-        f"Channels: {', '.join(n for n, _ in CHANNELS)}\n"
+        f"Source: @{SOURCE_IG_USER}\n"
         f"Daily limit: {DAILY_LIMIT} posts\n"
-        f"Check interval: every {CHECK_INTERVAL//60} min\n"
+        f"Checking every {CHECK_INTERVAL//60} min\n"
         "Send /check to scan now"
     )
     while True:
@@ -266,17 +329,15 @@ async def monitor_loop(app):
                 await asyncio.sleep(wait)
                 continue
 
-            videos    = get_all_wc_videos()
-            seen      = load_seen()
-            new       = [v for v in videos if v["id"] not in seen]
+            videos = get_all_wc_videos()
+            seen   = load_seen()
+            new    = [v for v in videos if v["id"] not in seen]
 
-            if not new:
-                logging.info("No new WC videos found.")
-            else:
-                notify(f"🔔 {len(new)} new WC video(s) found — posting...")
+            if new:
+                notify(f"🔔 {len(new)} new WC video(s) — posting...")
                 for video in new:
                     if get_posted_today() >= DAILY_LIMIT:
-                        notify(f"⏸ Daily limit hit. {len(new)} remaining for tomorrow.")
+                        notify(f"⏸ Daily limit hit. {len(new)} queued for tomorrow.")
                         break
                     if Path("paused.flag").exists():
                         break
@@ -288,85 +349,43 @@ async def monitor_loop(app):
 
         await asyncio.sleep(CHECK_INTERVAL)
 
-# ── Telegram commands ─────────────────────────────────────────────────────────
+# ── Commands ──────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🏆 WCDAILY Bot\n\n"
+        f"Source: @{SOURCE_IG_USER}\n"
+        f"Daily limit: {DAILY_LIMIT} posts\n\n"
         "Commands:\n"
-        "/check — scan RSS now + show queue\n"
-        "/next — post next video in queue\n"
-        "/post [url] — manually post a YouTube URL\n"
+        "/check — scan now + show queue\n"
+        "/next — post next in queue\n"
         "/status — integrations + stats\n"
         "/today — posts count today\n"
         "/pause — pause auto-posting\n"
-        "/resume — resume auto-posting"
+        "/resume — resume posting"
     )
 
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Scanning RSS feeds...")
+    await update.message.reply_text(f"🔍 Scanning @{SOURCE_IG_USER}...")
     try:
         videos = get_all_wc_videos()
         seen   = load_seen()
         new    = [v for v in videos if v["id"] not in seen]
         msg = (
             f"📊 Scan results:\n"
-            f"WC videos in RSS: {len(videos)}\n"
+            f"WC videos found: {len(videos)}\n"
             f"Already posted: {len(videos) - len(new)}\n"
             f"Queue: {len(new)}\n"
             f"Posted today: {get_posted_today()}/{DAILY_LIMIT}\n"
         )
         if new:
             msg += "\nNext in queue:\n"
-            msg += "\n".join(f"• {v['title']}" for v in new[:5])
+            msg += "\n".join(f"• {v.get('title','')[:50]}" for v in new[:5])
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Manually post any YouTube URL."""
-    if not ctx.args:
-        await update.message.reply_text(
-            "Usage: /post [YouTube URL]\n\n"
-            "Example:\n/post https://youtube.com/shorts/xxxxx"
-        )
-        return
-    url = ctx.args[0]
-    caption = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else None
-    await update.message.reply_text(f"⬇️ Processing:\n{url}")
-
-    work_dir = tempfile.mkdtemp()
-    try:
-        clean     = download_and_strip(url, work_dir)
-        await update.message.reply_text("☁️ Uploading...")
-        video_url = upload_to_fileio(clean)
-        if not caption:
-            # Try to get title from yt-dlp
-            r = subprocess.run(
-                ["yt-dlp", url, "--print", "%(title)s", "--quiet"],
-                capture_output=True, text=True, timeout=30
-            )
-            title   = r.stdout.strip() or "World Cup Highlight"
-            caption = build_caption(title)
-        await update.message.reply_text("📲 Posting to Instagram...")
-        result = post_to_instagram(video_url, caption)
-        if "id" in result:
-            increment_posted_today()
-            await update.message.reply_text(
-                f"✅ Posted to Instagram!\n"
-                f"🆔 Post ID: {result['id']}\n"
-                f"📝 {caption[:100]}..."
-            )
-        else:
-            await update.message.reply_text(f"⚠️ IG error: {result}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
-
-
 async def cmd_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Post the next video in the queue without needing a URL."""
     await update.message.reply_text("🔍 Finding next in queue...")
     try:
         videos = get_all_wc_videos()
@@ -377,15 +396,15 @@ async def cmd_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         video = queue[0]
         await update.message.reply_text(
-            f"▶️ Next in queue:\n{video['title']}\n\n"
-            f"Remaining after this: {len(queue) - 1}"
+            f"▶️ Posting:\n{video.get('title','')[:60]}\n"
+            f"Queue remaining: {len(queue) - 1}"
         )
         work_dir = tempfile.mkdtemp()
         try:
-            clean     = download_and_strip(video["url"], work_dir)
+            clean     = download_video(video, work_dir)
             await update.message.reply_text("☁️ Uploading...")
             video_url = upload_to_fileio(clean)
-            caption   = build_caption(video["title"])
+            caption   = build_caption(video.get("caption", ""), video.get("title", ""))
             await update.message.reply_text("📲 Posting to Instagram...")
             result    = post_to_instagram(video_url, caption)
             if "id" in result:
@@ -393,7 +412,7 @@ async def cmd_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 mark_seen(video["id"])
                 await update.message.reply_text(
                     f"✅ Posted!\n"
-                    f"📹 {video['title']}\n"
+                    f"📹 {video.get('title','')[:60]}\n"
                     f"🆔 {result['id']}\n"
                     f"📊 {get_posted_today()}/{DAILY_LIMIT} today\n"
                     f"📋 {len(queue) - 1} left in queue"
@@ -405,7 +424,7 @@ async def cmd_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
     except Exception as e:
-        await update.message.reply_text(f"❌ Error fetching queue: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     seen = load_seen()
@@ -443,7 +462,6 @@ def main():
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("check",  cmd_check))
     app.add_handler(CommandHandler("next",   cmd_next))
-    app.add_handler(CommandHandler("post",   cmd_post))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("today",  cmd_today))
     app.add_handler(CommandHandler("pause",  cmd_pause))
