@@ -1,5 +1,5 @@
 python-telegram-bot==21.5
 requests==2.31.0
 yt-dlp==2024.3.10
-instagrapi==2.1.2
+instagrapi==1.16.0
 pydantic==1.10.13
