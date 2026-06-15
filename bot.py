@@ -295,6 +295,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🏆 WCDAILY Bot\n\n"
         "Commands:\n"
         "/check — scan RSS now + show queue\n"
+        "/next — post next video in queue\n"
         "/post [url] — manually post a YouTube URL\n"
         "/status — integrations + stats\n"
         "/today — posts count today\n"
@@ -363,6 +364,49 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
+
+async def cmd_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Post the next video in the queue without needing a URL."""
+    await update.message.reply_text("🔍 Finding next in queue...")
+    try:
+        videos = get_all_wc_videos()
+        seen   = load_seen()
+        queue  = [v for v in videos if v["id"] not in seen]
+        if not queue:
+            await update.message.reply_text("✅ Queue empty — no new WC videos.")
+            return
+        video = queue[0]
+        await update.message.reply_text(
+            f"▶️ Next in queue:\n{video['title']}\n\n"
+            f"Remaining after this: {len(queue) - 1}"
+        )
+        work_dir = tempfile.mkdtemp()
+        try:
+            clean     = download_and_strip(video["url"], work_dir)
+            await update.message.reply_text("☁️ Uploading...")
+            video_url = upload_to_fileio(clean)
+            caption   = build_caption(video["title"])
+            await update.message.reply_text("📲 Posting to Instagram...")
+            result    = post_to_instagram(video_url, caption)
+            if "id" in result:
+                increment_posted_today()
+                mark_seen(video["id"])
+                await update.message.reply_text(
+                    f"✅ Posted!\n"
+                    f"📹 {video['title']}\n"
+                    f"🆔 {result['id']}\n"
+                    f"📊 {get_posted_today()}/{DAILY_LIMIT} today\n"
+                    f"📋 {len(queue) - 1} left in queue"
+                )
+            else:
+                await update.message.reply_text(f"⚠️ IG error: {result}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error fetching queue: {e}")
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     seen = load_seen()
     await update.message.reply_text(
@@ -398,6 +442,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("check",  cmd_check))
+    app.add_handler(CommandHandler("next",   cmd_next))
     app.add_handler(CommandHandler("post",   cmd_post))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("today",  cmd_today))
