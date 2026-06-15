@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-import os, subprocess, shutil, tempfile, logging, asyncio, json, requests, datetime
-import xml.etree.ElementTree as ET
+import os, subprocess, shutil, tempfile, logging, asyncio, json, requests, datetime, base64
 from pathlib import Path
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update
@@ -12,13 +11,13 @@ TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_ADMIN_ID = int(os.environ["TELEGRAM_ADMIN_ID"])
 IG_ACCESS_TOKEN   = os.environ.get("IG_ACCESS_TOKEN", "")
 IG_USER_ID        = os.environ.get("IG_USER_ID", "")
+IG_SESSION_B64    = os.environ.get("IG_SESSION", "")
 SEEN_FILE         = Path("seen.json")
 POSTED_TODAY_FILE = Path("posted_today.json")
-CHECK_INTERVAL    = 1800  # 30 min
+SESSION_FILE      = Path("session.json")
+CHECK_INTERVAL    = 1800
 DAILY_LIMIT       = 10
-
-# Source: FIFA World Cup Instagram
-SOURCE_IG_USER    = "fifaworldcup"
+SOURCE_ACCOUNT    = "fifaworldcup"
 
 WC_KEYWORDS = [
     "world cup", "worldcup", "2026", "wc26", "goal", "match",
@@ -29,6 +28,34 @@ WC_KEYWORDS = [
     "scored", "penalty", "free kick", "hat trick", "assist",
     "winner", "eliminated", "knockout", "quarter", "semi", "fifa"
 ]
+
+# ── Session setup ─────────────────────────────────────────────────────────────
+
+def setup_session():
+    """Decode base64 session from env var and write to disk."""
+    if SESSION_FILE.exists():
+        return True
+    if not IG_SESSION_B64:
+        logging.error("IG_SESSION env var not set")
+        return False
+    try:
+        decoded = base64.b64decode(IG_SESSION_B64).decode("utf-8")
+        SESSION_FILE.write_text(decoded)
+        logging.info("Session file written from env var")
+        return True
+    except Exception as e:
+        logging.error(f"Session decode error: {e}")
+        return False
+
+def get_instagrapi_client():
+    """Get logged-in instagrapi client using session file."""
+    from instagrapi import Client
+    setup_session()
+    cl = Client()
+    cl.load_settings(str(SESSION_FILE))
+    cl.login(os.environ.get("IG_USERNAME", "wcupdaily"),
+             os.environ.get("IG_PASSWORD", ""))
+    return cl
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -69,120 +96,42 @@ def is_wc_related(text):
     t = (text or "").lower()
     return any(kw in t for kw in WC_KEYWORDS)
 
-# ── Fetch from Instagram source via Graph API ─────────────────────────────────
+# ── Fetch from @fifaworldcup via instagrapi ───────────────────────────────────
 
-def get_source_ig_videos() -> list:
-    """
-    Fetch recent Reels from @fifaworldcup using Instagram Graph API.
-    Requires IG_ACCESS_TOKEN with instagram_basic permission.
-    """
-    if not IG_ACCESS_TOKEN or not IG_USER_ID:
-        raise RuntimeError("Instagram not configured")
-
-    # Search for the fifaworldcup account ID first
-    # Then fetch their media — only works if they are in your test users
-    # or your app is approved for pages_read_engagement
-
-    # Alternative: use IG Basic Display API to fetch by username
-    # For now fetch from a hardcoded known ID or use oEmbed
-    url = f"https://graph.instagram.com/v18.0/{IG_USER_ID}/media"
-    params = {
-        "fields": "id,media_type,caption,media_url,permalink,timestamp",
-        "access_token": IG_ACCESS_TOKEN,
-        "limit": 20
-    }
-    r = requests.get(url, params=params, timeout=15)
-    data = r.json()
-    if "error" in data:
-        raise RuntimeError(f"IG API error: {data['error']}")
-
-    videos = []
-    for item in data.get("data", []):
-        if item.get("media_type") in ("VIDEO", "REELS"):
-            caption = item.get("caption", "")
+def get_source_videos() -> list:
+    """Fetch recent Reels from @fifaworldcup using instagrapi session."""
+    cl = get_instagrapi_client()
+    user_id = cl.user_id_from_username(SOURCE_ACCOUNT)
+    medias  = cl.user_medias(user_id, amount=20)
+    videos  = []
+    for m in medias:
+        if m.media_type in (2, 8):  # 2=video, 8=album
+            caption = m.caption_text or ""
+            title   = caption[:80] if caption else "FIFA World Cup"
+            if not is_wc_related(caption + title):
+                continue
             videos.append({
-                "id":        item["id"],
-                "title":     caption[:80] if caption else "FIFA World Cup",
-                "caption":   caption,
-                "url":       item.get("media_url", ""),
-                "permalink": item.get("permalink", ""),
+                "id":      str(m.pk),
+                "title":   title,
+                "caption": caption,
+                "url":     str(m.video_url) if m.video_url else "",
             })
     return videos
 
-def get_source_videos_ytdlp() -> list:
-    """
-    Fallback: use yt-dlp to fetch from Instagram profile.
-    Works on Railway for Instagram (unlike YouTube).
-    """
-    cmd = [
-        "yt-dlp",
-        f"https://www.instagram.com/{SOURCE_IG_USER}/reels/",
-        "--flat-playlist",
-        "--playlist-items", "1-20",
-        "--print", '{"id":"%(id)s","title":"%(title)s","url":"%(webpage_url)s"}',
-        "--quiet", "--no-warnings",
-        "--no-check-certificates",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    videos = []
-    for line in result.stdout.strip().splitlines():
-        try:
-            v = json.loads(line)
-            videos.append(v)
-        except Exception:
-            continue
-    return videos
-
-def get_all_wc_videos() -> list:
-    """Try Graph API first, fall back to yt-dlp."""
-    try:
-        videos = get_source_ig_videos()
-        logging.info(f"Graph API: {len(videos)} videos fetched")
-        return [v for v in videos if is_wc_related(v.get("caption", "") + v.get("title", ""))]
-    except Exception as e:
-        logging.warning(f"Graph API failed: {e} — trying yt-dlp")
-
-    try:
-        videos = get_source_videos_ytdlp()
-        logging.info(f"yt-dlp: {len(videos)} videos fetched")
-        return [v for v in videos if is_wc_related(v.get("title", ""))]
-    except Exception as e:
-        logging.error(f"yt-dlp also failed: {e}")
-        return []
-
-# ── Video download ────────────────────────────────────────────────────────────
+# ── Video processing ──────────────────────────────────────────────────────────
 
 def download_video(video: dict, work_dir: str) -> Path:
-    """
-    Download video — tries direct media_url first (fastest),
-    then falls back to yt-dlp with the permalink.
-    """
     raw   = Path(work_dir) / "raw.mp4"
     clean = Path(work_dir) / "clean.mp4"
 
-    # Try direct URL download first (from Graph API media_url)
+    # Download direct video URL (from instagrapi)
     direct_url = video.get("url", "")
-    if direct_url and direct_url.startswith("http"):
-        try:
-            r = requests.get(direct_url, timeout=60, stream=True)
-            if r.status_code == 200:
-                with open(raw, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                logging.info("Downloaded via direct URL")
-        except Exception as e:
-            logging.warning(f"Direct download failed: {e}")
-
-    # Fallback: yt-dlp with permalink or constructed URL
-    if not raw.exists() or raw.stat().st_size < 1000:
-        permalink = video.get("permalink") or f"https://www.instagram.com/p/{video['id']}/"
-        subprocess.run([
-            "yt-dlp", permalink,
-            "-o", str(raw),
-            "-f", "best[ext=mp4]/best",
-            "--quiet", "--no-warnings",
-            "--no-check-certificates",
-        ], timeout=120, capture_output=True)
+    if direct_url:
+        r = requests.get(direct_url, timeout=60, stream=True)
+        if r.status_code == 200:
+            with open(raw, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
 
     if not raw.exists() or raw.stat().st_size < 1000:
         raise RuntimeError("Download failed — file empty or missing")
@@ -201,8 +150,6 @@ def download_video(video: dict, work_dir: str) -> Path:
     if not clean.exists():
         raise RuntimeError("FFmpeg processing failed")
     return clean
-
-# ── Upload + post ─────────────────────────────────────────────────────────────
 
 def upload_to_fileio(video_path: Path) -> str:
     with open(video_path, "rb") as f:
@@ -251,8 +198,8 @@ def post_to_instagram(video_url: str, caption: str) -> dict:
     )
     return pub.json()
 
-def build_caption(original_caption: str, title: str = "") -> str:
-    base = (original_caption or title or "FIFA World Cup Highlight")[:300]
+def build_caption(caption: str, title: str = "") -> str:
+    base = (caption or title or "FIFA World Cup Highlight")[:300]
     tags = "#WorldCup #FIFA #wcdaily #Reels #Football"
     t = base.lower()
     extra = []
@@ -276,7 +223,7 @@ def process_video(video: dict) -> bool:
     try:
         notify(f"⬇️ Downloading:\n{video.get('title','')[:60]}")
         clean     = download_video(video, work_dir)
-        notify("☁️ Uploading to temp host...")
+        notify("☁️ Uploading...")
         video_url = upload_to_fileio(clean)
         caption   = build_caption(video.get("caption", ""), video.get("title", ""))
         notify("📲 Posting to Instagram...")
@@ -296,7 +243,7 @@ def process_video(video: dict) -> bool:
             mark_seen(video["id"])
             return False
     except Exception as e:
-        notify(f"❌ Failed:\n{str(e)[:200]}")
+        notify(f"❌ Failed: {str(e)[:200]}")
         return False
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -307,10 +254,9 @@ async def monitor_loop(app):
     await asyncio.sleep(5)
     notify(
         "🤖 WCDAILY Bot started\n"
-        f"Source: @{SOURCE_IG_USER}\n"
+        f"Source: @{SOURCE_ACCOUNT}\n"
         f"Daily limit: {DAILY_LIMIT} posts\n"
-        f"Checking every {CHECK_INTERVAL//60} min\n"
-        "Send /check to scan now"
+        f"Checking every {CHECK_INTERVAL//60} min"
     )
     while True:
         try:
@@ -324,20 +270,18 @@ async def monitor_loop(app):
                 midnight = (now + datetime.timedelta(days=1)).replace(
                     hour=0, minute=5, second=0, microsecond=0
                 )
-                wait = (midnight - now).total_seconds()
-                notify(f"⏸ Daily limit {DAILY_LIMIT} reached. Resuming tomorrow.")
-                await asyncio.sleep(wait)
+                await asyncio.sleep((midnight - now).total_seconds())
                 continue
 
-            videos = get_all_wc_videos()
+            videos = get_source_videos()
             seen   = load_seen()
             new    = [v for v in videos if v["id"] not in seen]
 
             if new:
-                notify(f"🔔 {len(new)} new WC video(s) — posting...")
+                notify(f"🔔 {len(new)} new WC video(s) found — posting...")
                 for video in new:
                     if get_posted_today() >= DAILY_LIMIT:
-                        notify(f"⏸ Daily limit hit. {len(new)} queued for tomorrow.")
+                        notify(f"⏸ Daily limit hit.")
                         break
                     if Path("paused.flag").exists():
                         break
@@ -354,21 +298,21 @@ async def monitor_loop(app):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🏆 WCDAILY Bot\n\n"
-        f"Source: @{SOURCE_IG_USER}\n"
+        f"Source: @{SOURCE_ACCOUNT}\n"
         f"Daily limit: {DAILY_LIMIT} posts\n\n"
         "Commands:\n"
-        "/check — scan now + show queue\n"
+        "/check — scan now\n"
         "/next — post next in queue\n"
-        "/status — integrations + stats\n"
-        "/today — posts count today\n"
-        "/pause — pause auto-posting\n"
-        "/resume — resume posting"
+        "/status — stats\n"
+        "/today — posts today\n"
+        "/pause — pause\n"
+        "/resume — resume"
     )
 
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🔍 Scanning @{SOURCE_IG_USER}...")
+    await update.message.reply_text(f"🔍 Scanning @{SOURCE_ACCOUNT}...")
     try:
-        videos = get_all_wc_videos()
+        videos = get_source_videos()
         seen   = load_seen()
         new    = [v for v in videos if v["id"] not in seen]
         msg = (
@@ -388,11 +332,11 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Finding next in queue...")
     try:
-        videos = get_all_wc_videos()
+        videos = get_source_videos()
         seen   = load_seen()
         queue  = [v for v in videos if v["id"] not in seen]
         if not queue:
-            await update.message.reply_text("✅ Queue empty — no new WC videos.")
+            await update.message.reply_text("✅ Queue empty.")
             return
         video = queue[0]
         await update.message.reply_text(
@@ -415,7 +359,7 @@ async def cmd_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"📹 {video.get('title','')[:60]}\n"
                     f"🆔 {result['id']}\n"
                     f"📊 {get_posted_today()}/{DAILY_LIMIT} today\n"
-                    f"📋 {len(queue) - 1} left in queue"
+                    f"📋 {len(queue)-1} left"
                 )
             else:
                 await update.message.reply_text(f"⚠️ IG error: {result}")
@@ -428,7 +372,9 @@ async def cmd_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     seen = load_seen()
+    session_ok = SESSION_FILE.exists() or bool(IG_SESSION_B64)
     await update.message.reply_text(
+        f"{'✅' if session_ok else '❌'} Instagram session\n"
         f"{'✅' if IG_ACCESS_TOKEN else '❌'} Instagram token\n"
         f"{'✅' if IG_USER_ID else '❌'} Instagram user ID\n"
         f"📊 {get_posted_today()}/{DAILY_LIMIT} posted today\n"
@@ -437,9 +383,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"📊 Posted today: {get_posted_today()}/{DAILY_LIMIT}"
-    )
+    await update.message.reply_text(f"📊 Posted today: {get_posted_today()}/{DAILY_LIMIT}")
 
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     Path("paused.flag").write_text("1")
@@ -455,9 +399,8 @@ async def on_error(update, ctx):
         raise SystemExit(1)
     logging.error(f"Error: {ctx.error}")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def main():
+    setup_session()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("check",  cmd_check))
