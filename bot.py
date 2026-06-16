@@ -125,22 +125,22 @@ def download_video(video: dict, work_dir: str) -> Path:
     raw   = Path(work_dir) / "raw.mp4"
     clean = Path(work_dir) / "clean.mp4"
 
-    # Use instagrapi to download directly — avoids expired CDN URLs
+    # Fetch fresh video info from instagrapi to get non-expired URL
     try:
-        cl      = get_instagrapi_client()
-        pk      = video.get("pk") or video.get("id")
-        dl_path = cl.video_download(pk, folder=Path(work_dir))
-        if dl_path and Path(dl_path).exists():
-            Path(dl_path).rename(raw)
+        cl  = get_instagrapi_client()
+        pk  = video.get("pk") or video.get("id")
+        # Get fresh media info with current CDN URL
+        info = cl.media_info(pk)
+        fresh_url = str(info.video_url)
+        logging.info(f"Fresh URL: {fresh_url[:80]}")
+        r = requests.get(fresh_url, timeout=120, stream=True,
+                        headers={"User-Agent": "Instagram 275.0.0.27.98 Android"})
+        if r.status_code == 200:
+            with open(raw, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
     except Exception as e:
-        logging.warning(f"instagrapi download failed: {e} — trying direct URL")
-        direct_url = video.get("url", "")
-        if direct_url:
-            r = requests.get(direct_url, timeout=60, stream=True)
-            if r.status_code == 200:
-                with open(raw, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
+        logging.warning(f"Fresh URL download failed: {e}")
 
     if not raw.exists() or raw.stat().st_size < 1000:
         raise RuntimeError("Download failed — file empty or missing")
