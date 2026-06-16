@@ -48,12 +48,16 @@ def setup_session():
         return False
 
 def get_instagrapi_client():
-    """Get logged-in instagrapi client using session file."""
+    """Get logged-in instagrapi client using session file + proxy."""
     from instagrapi import Client
     setup_session()
     cl = Client()
+    proxy = os.environ.get("PROXY_URL", "")
+    if proxy:
+        cl.set_proxy(proxy)
+        logging.info(f"Using proxy: {proxy[:30]}...")
     cl.load_settings(str(SESSION_FILE))
-    cl.login(os.environ.get("IG_USERNAME", "wcupdaily"),
+    cl.login(os.environ.get("IG_USERNAME", ""),
              os.environ.get("IG_PASSWORD", ""))
     return cl
 
