@@ -115,6 +115,7 @@ def get_source_videos() -> list:
                 "title":   title,
                 "caption": caption,
                 "url":     str(m.video_url) if m.video_url else "",
+                "pk":      str(m.pk),
             })
     return videos
 
@@ -124,14 +125,22 @@ def download_video(video: dict, work_dir: str) -> Path:
     raw   = Path(work_dir) / "raw.mp4"
     clean = Path(work_dir) / "clean.mp4"
 
-    # Download direct video URL (from instagrapi)
-    direct_url = video.get("url", "")
-    if direct_url:
-        r = requests.get(direct_url, timeout=60, stream=True)
-        if r.status_code == 200:
-            with open(raw, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
+    # Use instagrapi to download directly — avoids expired CDN URLs
+    try:
+        cl      = get_instagrapi_client()
+        pk      = video.get("pk") or video.get("id")
+        dl_path = cl.video_download(pk, folder=Path(work_dir))
+        if dl_path and Path(dl_path).exists():
+            Path(dl_path).rename(raw)
+    except Exception as e:
+        logging.warning(f"instagrapi download failed: {e} — trying direct URL")
+        direct_url = video.get("url", "")
+        if direct_url:
+            r = requests.get(direct_url, timeout=60, stream=True)
+            if r.status_code == 200:
+                with open(raw, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
 
     if not raw.exists() or raw.stat().st_size < 1000:
         raise RuntimeError("Download failed — file empty or missing")
