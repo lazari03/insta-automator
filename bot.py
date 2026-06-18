@@ -4,6 +4,9 @@ FIFA World Cup Instagram Reels Automation Bot
 Fixed version with proper async handling, deduplicated code, and bug fixes.
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import subprocess
 import shutil
@@ -87,9 +90,8 @@ def get_instagrapi_client():
         cl.set_proxy(PROXY_URL)
         logging.info(f"Using proxy: {PROXY_URL[:30]}...")
     cl.load_settings(str(SESSION_FILE))
-    # Only login if session is expired/invalid; load_settings usually sufficient
     try:
-        cl.get_timeline_feed()  # Test if session is valid
+        cl.get_timeline_feed()
     except Exception:
         logging.info("Session expired, re-logging in...")
         cl.login(IG_USERNAME, IG_PASSWORD)
@@ -143,8 +145,7 @@ def get_source_videos() -> list:
     medias = cl.user_medias(user_id, amount=20)
     videos = []
     for m in medias:
-        # 1=photo, 2=video, 8=album (carousel)
-        if m.media_type == 2:  # Video/Reel only
+        if m.media_type == 2:
             caption = m.caption_text or ""
             title = caption[:80] if caption else "FIFA World Cup"
             if not is_wc_related(caption + title):
@@ -157,7 +158,6 @@ def get_source_videos() -> list:
                 "pk":      str(m.pk),
             })
         elif m.media_type == 8 and m.resources:
-            # Album: check if any resource is a video
             for idx, res in enumerate(m.resources):
                 if res.media_type == 2 and res.video_url:
                     caption = m.caption_text or ""
@@ -171,7 +171,7 @@ def get_source_videos() -> list:
                         "url":     str(res.video_url),
                         "pk":      str(m.pk),
                     })
-                    break  # Only take first video from album
+                    break
     return videos
 
 # ── Video Processing ───────────────────────────────────────────────────────────
@@ -180,7 +180,6 @@ def download_video(video: dict, work_dir: str) -> Path:
     raw = Path(work_dir) / "raw.mp4"
     clean = Path(work_dir) / "clean.mp4"
 
-    # Attempt 1: Direct Download via fresh Instagram CDN URL
     if not raw.exists() or raw.stat().st_size < 1000:
         try:
             cl = get_instagrapi_client()
@@ -206,7 +205,6 @@ def download_video(video: dict, work_dir: str) -> Path:
         except Exception as e:
             logging.warning(f"Direct CDN download failed: {e}")
 
-    # Attempt 2: Fallback to yt-dlp with Android-Client spoofing
     if not raw.exists() or raw.stat().st_size < 1000:
         logging.info("Triggering yt-dlp fallback...")
         try:
@@ -233,7 +231,6 @@ def download_video(video: dict, work_dir: str) -> Path:
     if not raw.exists() or raw.stat().st_size < 1000:
         raise RuntimeError("Download failed — file missing or empty")
 
-    # Strip metadata + ensure 9:16 + force IG-compatible encoding
     result = subprocess.run([
         "ffmpeg", "-y", "-i", str(raw),
         "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "-1",
@@ -265,7 +262,6 @@ def upload_to_fileio(video_path: Path) -> str:
             timeout=120
         )
     data = r.json()
-    # file.io response format: {"success": true, "status": 200, "id": "...", "key": "...", "link": "...", "expiry": "..."}
     link = data.get("link") or data.get("url")
     if not link:
         raise RuntimeError(f"Upload failed: {data}")
@@ -276,7 +272,6 @@ def post_to_instagram(video_url: str, caption: str) -> dict:
     if not IG_ACCESS_TOKEN or not IG_USER_ID:
         return {"error": "Instagram not configured"}
 
-    # Step 1: Create media container
     r = requests.post(
         f"https://graph.instagram.com/v22.0/{IG_USER_ID}/media",
         data={
@@ -293,7 +288,6 @@ def post_to_instagram(video_url: str, caption: str) -> dict:
         raise RuntimeError(f"Container creation failed: {data}")
     container_id = data["id"]
 
-    # Step 2: Poll for processing completion
     for attempt in range(60):
         time.sleep(10)
         s = requests.get(
@@ -310,7 +304,6 @@ def post_to_instagram(video_url: str, caption: str) -> dict:
     else:
         raise RuntimeError("IG processing timeout")
 
-    # Step 3: Publish
     pub = requests.post(
         f"https://graph.instagram.com/v22.0/{IG_USER_ID}/media_publish",
         data={"creation_id": container_id, "access_token": IG_ACCESS_TOKEN},
@@ -356,7 +349,6 @@ async def run_pipeline():
 
     seen_ids = load_seen()
 
-    # Run blocking instagrapi call in thread pool
     loop = asyncio.get_running_loop()
     try:
         videos = await loop.run_in_executor(None, get_source_videos)
@@ -374,19 +366,16 @@ async def run_pipeline():
 
         with tempfile.TemporaryDirectory() as tmpdir:
             try:
-                # Run blocking download in thread pool
                 clean_path = await loop.run_in_executor(
                     None, partial(download_video, vid, tmpdir)
                 )
 
-                # Upload to temporary hosting
                 cdn_url = await loop.run_in_executor(
                     None, upload_to_fileio, clean_path
                 )
 
                 caption = build_caption(vid["caption"], vid["title"])
 
-                # Post to Instagram
                 result = await loop.run_in_executor(
                     None, partial(post_to_instagram, cdn_url, caption)
                 )
@@ -475,24 +464,22 @@ async def main():
     app.add_handler(CommandHandler("pause", pause_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
 
-    # Start background cron loop
     asyncio.create_task(cron_loop())
 
     logging.info("Bot starting...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
 
-    # Keep running until interrupted
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+    async with app:
+        await app.updater.start_polling()
+        logging.info("Polling started. Bot is ready.")
+        notify("🤖 Bot started and polling.")
+
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await app.updater.stop()
 
 if __name__ == "__main__":
     try:
